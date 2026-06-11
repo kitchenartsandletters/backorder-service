@@ -2,7 +2,7 @@
 
 ### ✅ Definition
 
-A backorder book is a **post-release** title that is **temporarily out of stock** but still **in print and expected to restock**. Customers may be allowed to order or request notification.
+A backorder book is a **post-release-date** title that is **temporarily out of stock** but still **in print and expected to restock**. Customers may be allowed to order or request notification. Backorders are distinct from other book/product statuses (i.e. preorder, out-of-print, requests, etc) and involves a committed quantity and sales deficit currently owed to the customer.
 
 ---
 
@@ -12,11 +12,12 @@ A backorder book is a **post-release** title that is **temporarily out of stock*
 
 - `Track quantity`: ✅ Enabled
 
-- `Inventory`: ≤ `0`
+- `Inventory` (at the time of sale): ≤ `0`
 
 - `Continue selling when out of stock`: ✅ Must be ON for a book to be **considered backorderable**
 
   - If OFF, the book is either **Out of Stock** or **Out of Print** (OOP).
+  - A Backorder sale event may uncover an "Temporarily OOS" or OOP status that previous went undetected
 
 #### Cart Behavior
 
@@ -24,25 +25,13 @@ A backorder book is a **post-release** title that is **temporarily out of stock*
 
 - If ON, cart is allowed and product is treated as **backordered**.
 
-#### Notify Me Flow
-
-- Custom Notify Me form is rendered:
-
-  - Injected via snippet or `custom.js`
-
-  - Uses `product.id` or `variant.id` to track interest in Supabase
-
-- The flow can be **blacklisted** by Admins via the **Request Service dashboard**.
-
 #### Restock Ops
 
 - Upon restock:
 
-  - Notify Me form disappears (via Liquid or JavaScript).
+  - Backorders are filled chronologically as fresh inventory allows
 
-  - Admin manually sends notifications to customers.
-
-- ⚠️ Automated notifications via Request Service are a **planned future enhancement**.
+- ⚠️ Automated backorder customer notifications, alerts as well as back office operations notifications and alerts are a **planned future enhancement**.
 
 ---
 
@@ -52,15 +41,11 @@ A backorder book is a **post-release** title that is **temporarily out of stock*
 
 |------------------------|--------------------------------------------------------|
 
-| `Preorder Service`     | Webhook-triggered lifecycle management of preorder SKUs. |
+| `Preorder Service`     | Lifecycle management of preorder SKUs. Negative inventory or committed quantities are handled distinctly and separately from the Backorder Service |
 
-| `Backorder Service`    | Tracks interest, stock restoration, and notification queueing. |
+| `Backorder Service`    | Will track committed sales quantities, stock restoration, and notification queueing. This is distinct from the preorder service |
 
-| `webhook-gateway`      | Ingests product updates (tags, inventory, pub date changes) for both services. |
-
-| `NYT Weekly Tool`      | Tracks weekly presales, links with `Preorder Service` for pub week matching. |
-
-> The `NYT Weekly Reporting Tool` will be **standalone**, with optional linkage to Preorder Service to produce comprehensive CSV snapshots for internal and publisher-facing reporting.
+| `webhook-gateway`      | Ingests product and inventory updates for all services. |
 
 ---
 
@@ -70,23 +55,14 @@ A backorder book is a **post-release** title that is **temporarily out of stock*
 
 - Backorder lifecycle is **driven by inventory + restock expectation**, not tags.
 
-- Notify form logic must be tightly scoped to:
-
-  - **In-stock status**
-
-  - **Blacklist inclusion**
-
-  - **Restock confirmation**
-
-- Both services will include **Slack alert integrations**, **Supabase data logging**, and **Admin Dashboard visibility**.
+- The backorder service will make use of **Mailtrap API integrations**, **Supabase data logging**, and **Admin Dashboard visibility**.
 
 # 📦 Backorder Service
 
-The **Backorder Service** monitors inventory fluctuations and customer interest for **temporarily out-of-stock books** that are still in print and expected to restock.
+The **Backorder Service** monitors inventory fluctuations for **temporarily out-of-stock books** that are still in print and expected to restock.
 
 It integrates with:
 - `webhook-gateway`: Shopify data ingestion
-- `Request Service`: Supabase-based logging of Notify Me requests
 - `Admin Dashboard`: Visibility into customer interest and restock triggers
 
 ---
@@ -94,58 +70,45 @@ It integrates with:
 ## 📦 Input Data
 
 ### ✅ Webhooks Ingested
-- `inventory_levels/update`
-- `products/update`
-- `variants/update`
+
+- Order creation
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
+- Order fulfillment
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
+- Order cancellation
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
+- Refund create
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
+- Inventory level update
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
+- Product update
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
+- Order payment
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
+- Product creation
+https://webhook-gateway-production.up.railway.app/webhooks/shopify • JSON
 
 ### ✅ Shopify Data Fields Used
-| Field/Source                       | Purpose                            |
-|------------------------------------|------------------------------------|
-| `Track quantity`                   | Required to determine stock status |
-| `Inventory level`                  | Drives in/out of backorder state   |
-| `Continue selling when out of stock` | Used to permit/disallow backorder |
-| `Tag: out-of-print` (optional)     | Exclusion logic for OOP books      |
-
----
+- see apps-inventory-mgmt.md for GraphQL data handling.
 
 ## 🔄 Lifecycle Logic
 
 | Condition                                | Action                               |
 |------------------------------------------|--------------------------------------|
 | Inventory ≤ 0 and continue selling = ON  | Mark as backorderable                |
-| Inventory ≤ 0 and continue selling = OFF | Mark as out of stock                 |
-| Inventory restocked > 0                  | Notify customers, close requests     |
-| Notify form submission                   | Log to Supabase with `product_id`    |
-
----
-
-## 🧾 Notify Me Logic
-
-| Phase         | Behavior                                  |
-|---------------|-------------------------------------------|
-| Product OOS   | Form appears (unless blacklisted)         |
-| Submission    | Sent to `request_service.requests` table  |
-| Admin review  | View and manage via Admin Dashboard       |
-| Restock       | Manual notifications (automated = future) |
-| Closeout      | Mark request `status: closed`             |
-
-> ⚠️ Future automation via webhook will allow real-time restock detection + customer contact.
+| Inventory ≤ 0 and continue selling = OFF | Out of stock; orders not allowed     |
+| Inventory restocked                      | Inventory levels are not reliable    |
+|                                          | since partial receipts could         |
+|                                          | potentially cover only some of the   |
+|                                          | live backorders. Inventory is        |
+|                                          | received and then backorders are     |
+|                                          | fulfilled. Committed quantity is only|
+|                                          | affected on the order level so is a  |
+|                                          | stronger indication of an order's    |
+|                                          | backorder status.                    |
 
 ---
 
 ## 🧠 Admin Dashboard UI
 
-| Component        | Functionality                           |
-|------------------|-----------------------------------------|
-| Request Service  | View requests by product, status        |
-| Blacklist Toggle | Prevent Notify form from appearing      |
-| Slack Notification Log | Coming soon                        |
-
----
-
-## 🛠️ TODO / Future
-
-- [ ] Slack alerts when restock triggers active requests
-- [ ] Supabase webhook on `request.status = open` to detect stale entries
-- [ ] Bulk CSV upload for historical request import
-- [ ] Integration with Preorder Service for dual-status SKUs
+- refer to github repo admin-dashboard.
