@@ -1,11 +1,14 @@
 """Webhook ingestion from webhook-gateway.
 
-Contract (mirrors preorder-service):
+Contract (matches gateway externalDeliveryService):
   - Gateway POSTs raw Shopify payloads with X-Shopify-Topic,
     X-Shopify-Hmac-Sha256, X-Shopify-Shop-Domain passed through, plus
-    X-Gateway-Event-ID / X-Gateway-Signature / X-Gateway-Timestamp.
+    X-Gateway-Signature / X-Gateway-Timestamp / X-Retry-Attempt.
   - Verification: Shopify HMAC first; fall back to gateway signature.
-  - Idempotency: backorder.events PK on event_id; duplicate deliveries no-op.
+  - Idempotency: the gateway does NOT send an event-id header, so event_id is
+    derived deterministically (uuid5) from topic + payload identity. Gateway
+    retries re-send identical bytes -> identical event_id -> no-op. Distinct
+    real events differ on id/updated_at -> distinct event_ids.
   - Always 200 after recording; processing errors are stored on the event row
     (replayable) rather than bounced back to the gateway.
 """
@@ -30,17 +33,7 @@ log = logging.getLogger("uvicorn.error")
 router = APIRouter()
 UTC = timezone.utc
 
-ORDER_TOPICS = {
-    "orders/create",
-    "orders/paid",
-    "orders/fulfilled",
-    "orders/cancelled",
-    "orders/updated",
-    "refunds/create",
-    "inventory_levels/update",
-    "products/update",
-    "products/create",
-}
+EVENT_NAMESPACE = uuid.NAMESPACE_URL
 
 
 def _b64_hmac(secret: str, raw: bytes) -> str:
@@ -58,18 +51,34 @@ def _verify_signature(raw: bytes, headers: dict) -> bool:
     if EXTERNAL_HMAC_SECRET and gw_sig:
         if hmac.compare_digest(_b64_hmac(EXTERNAL_HMAC_SECRET, raw), gw_sig):
             return True
+        # Gateway may sign "timestamp.body" — accept that variant too
+        ts = headers.get("x-gateway-timestamp")
+        if ts:
+            signed = f"{ts}.".encode("utf-8") + raw
+            if hmac.compare_digest(_b64_hmac(EXTERNAL_HMAC_SECRET, signed), gw_sig):
+                return True
     if not SHOPIFY_WEBHOOK_SECRET and not EXTERNAL_HMAC_SECRET:
         return True  # dev mode: no secrets configured
     return False
 
 
-def _safe_event_id(value: Optional[str]) -> str:
-    if value:
+def _derive_event_id(header_value: Optional[str], topic: str, payload: dict, raw: bytes) -> str:
+    """Deterministic idempotency key.
+
+    Priority: explicit gateway header (if ever added) -> uuid5 of topic +
+    payload identity + change marker -> uuid5 of raw bytes as last resort.
+    """
+    if header_value:
         try:
-            return str(uuid.UUID(value))
+            return str(uuid.UUID(header_value))
         except ValueError:
             pass
-    return str(uuid.uuid4())
+
+    ident = payload.get("id") or payload.get("order_id") or payload.get("inventory_item_id")
+    marker = payload.get("updated_at") or payload.get("created_at") or ""
+    if ident is not None:
+        return str(uuid.uuid5(EVENT_NAMESPACE, f"backorder:{topic}:{ident}:{marker}"))
+    return str(uuid.uuid5(EVENT_NAMESPACE, f"backorder:{topic}:{hashlib.sha256(raw).hexdigest()}"))
 
 
 def _ledger_has_order(sb, order_id: int) -> bool:
@@ -123,7 +132,7 @@ async def _handle(topic: str, request: Request, shopify: ShopifyClient) -> JSONR
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     sb = get_supabase_client()
-    event_id = _safe_event_id(headers.get("x-gateway-event-id"))
+    event_id = _derive_event_id(headers.get("x-gateway-event-id"), topic, payload, raw)
 
     inserted = (
         sb.schema("backorder")
@@ -137,7 +146,7 @@ async def _handle(topic: str, request: Request, shopify: ShopifyClient) -> JSONR
                 "headers": {
                     k: v
                     for k, v in headers.items()
-                    if k.startswith("x-shopify") or k.startswith("x-gateway")
+                    if k.startswith("x-shopify") or k.startswith("x-gateway") or k == "x-retry-attempt"
                 },
             },
             on_conflict="event_id",
@@ -177,6 +186,7 @@ async def _handle(topic: str, request: Request, shopify: ShopifyClient) -> JSONR
 
 
 @router.post("/webhooks")
+@router.post("/webhooks/")
 async def catch_all(request: Request, shopify: ShopifyClient = Depends(get_shopify_client)):
     """Gateway POSTs here with topic in X-Shopify-Topic."""
     topic = (request.headers.get("X-Shopify-Topic") or "").strip().lower()
