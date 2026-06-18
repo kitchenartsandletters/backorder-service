@@ -1,8 +1,13 @@
 import asyncio
+import logging
 import os
 from typing import Any, Dict, Optional
 
 import httpx
+
+from shopify_token import get_token_manager
+
+logger = logging.getLogger(__name__)
 
 
 class ShopifyGraphQLError(Exception):
@@ -14,28 +19,28 @@ class ShopifyHTTPError(Exception):
 
 
 class ShopifyClient:
-    """Async GraphQL client. Mirrors preorder-service shopify_client.py."""
+    """Async GraphQL client. The Admin API token is supplied per-request by the
+    shared client-credentials token manager (shopify_token); this client never
+    reads SHOPIFY_ACCESS_TOKEN. Mirrors preorder-service shopify_client.py."""
 
     def __init__(self) -> None:
         self.shop_url = os.getenv("SHOP_URL")
-        self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
-        self.api_version = os.getenv("API_VERSION", "2025-10")
-
         if not self.shop_url:
             raise ValueError("SHOP_URL is not set")
-        if not self.access_token:
-            raise ValueError("SHOPIFY_ACCESS_TOKEN is not set")
 
-        self.endpoint = (
-            f"https://{self.shop_url}/admin/api/{self.api_version}/graphql.json"
+        # Accept both version env names; standardize on SHOPIFY_API_VERSION.
+        self.api_version = (
+            os.getenv("SHOPIFY_API_VERSION")
+            or os.getenv("API_VERSION")
+            or "2025-10"
         )
+        domain = self.shop_url.split("://", 1)[-1].rstrip("/")
+        self.endpoint = f"https://{domain}/admin/api/{self.api_version}/graphql.json"
 
+        self._tokens = get_token_manager()
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(20.0, connect=10.0),
-            headers={
-                "X-Shopify-Access-Token": self.access_token,
-                "Content-Type": "application/json",
-            },
+            headers={"Content-Type": "application/json"},
         )
 
     async def close(self) -> None:
@@ -45,14 +50,17 @@ class ShopifyClient:
         self,
         query: str,
         variables: Optional[Dict[str, Any]] = None,
-        max_retries: int = 3,
+        max_retries: int = 5,
     ) -> Dict[str, Any]:
         payload = {"query": query, "variables": variables or {}}
         attempt = 0
         backoff = 0.5
+        did_auth_retry = False
 
         while True:
             attempt += 1
+            self._client.headers["X-Shopify-Access-Token"] = await self._tokens.get_token()
+
             try:
                 response = await self._client.post(self.endpoint, json=payload)
             except httpx.RequestError as exc:
@@ -61,7 +69,16 @@ class ShopifyClient:
                         f"Network error after {attempt} attempts: {exc}"
                     ) from exc
                 await asyncio.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 2, 10)
+                continue
+
+            # Expired/invalid token: refresh once, retry (off the retry budget).
+            if response.status_code == 401 and not did_auth_retry:
+                logger.warning("[shopify] 401; refreshing token and retrying once.")
+                did_auth_retry = True
+                self._tokens.invalidate()
+                self._client.headers["X-Shopify-Access-Token"] = \
+                    await self._tokens.get_token(force_refresh=True)
                 continue
 
             if response.status_code >= 500:
@@ -70,7 +87,7 @@ class ShopifyClient:
                         f"Shopify 5xx error: {response.status_code} {response.text}"
                     )
                 await asyncio.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 2, 10)
                 continue
 
             if response.status_code != 200:
@@ -80,7 +97,17 @@ class ShopifyClient:
 
             data = response.json()
             if "errors" in data:
-                raise ShopifyGraphQLError(data["errors"])
+                errors = data["errors"]
+                throttled = isinstance(errors, list) and any(
+                    isinstance(e, dict) and e.get("extensions", {}).get("code") == "THROTTLED"
+                    for e in errors
+                )
+                if throttled and attempt < max_retries:
+                    logger.warning("[shopify] THROTTLED; backing off %.1fs", backoff)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 10)
+                    continue
+                raise ShopifyGraphQLError(errors)
             return data.get("data", {})
 
     # ------------------------------------------------------------------

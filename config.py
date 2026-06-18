@@ -8,12 +8,17 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# Shopify
+# Shopify — client credentials grant. The Admin API token is minted at runtime
+# by shopify_token from the Client ID/secret; it is never stored here.
 SHOP_URL = os.getenv("SHOP_URL")  # store.myshopify.com
-SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-API_VERSION = os.getenv("API_VERSION", "2025-10")
+SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID")
+SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 
-# Webhook verification (either is sufficient; both optional in dev)
+# Webhook verification (either is sufficient; both optional in dev).
+# NOTE: SHOPIFY_WEBHOOK_SECRET is the store-level webhook signing secret and
+# EXTERNAL_HMAC_SECRET is the gateway signature — neither is the app Client
+# secret, and neither is affected by the app migration.
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
 EXTERNAL_HMAC_SECRET = os.getenv("EXTERNAL_HMAC_SECRET", "")  # gateway X-Gateway-Signature
 
